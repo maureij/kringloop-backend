@@ -1,0 +1,192 @@
+// server.js — KringloopKompas REST API
+require(‘dotenv’).config();
+const express = require(‘express’);
+const cors = require(‘cors’);
+const cron = require(‘node-cron’);
+const db = require(’./db’);
+const { runScraper } = require(’./scraper’);
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+app.use(cors({
+origin: process.env.ALLOWED_ORIGINS?.split(’,’) || ‘*’,
+}));
+app.use(express.json());
+
+// Simpele API-key bescherming voor write-endpoints (optioneel)
+function requireKey(req, res, next) {
+const key = process.env.API_KEY;
+if (!key) return next(); // geen key ingesteld = open
+if (req.headers[‘x-api-key’] === key) return next();
+res.status(401).json({ error: ‘Ongeldige API key’ });
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+// GET /shops — alle winkels (met optionele filters)
+app.get(’/shops’, (req, res) => {
+try {
+let shops = db.getAll();
+
+```
+// Filter: assortiment
+if (req.query.assortment) {
+  const cats = req.query.assortment.split(',');
+  shops = shops.filter(s => cats.some(c => s.assortment.includes(c)));
+}
+
+// Filter: min rating
+if (req.query.minRating) {
+  shops = shops.filter(s => s.rating >= parseFloat(req.query.minRating));
+}
+
+// Filter: stad
+if (req.query.city) {
+  const city = req.query.city.toLowerCase();
+  shops = shops.filter(s => s.city.toLowerCase().includes(city));
+}
+
+// Filter: open nu
+if (req.query.openNow === 'true') {
+  shops = shops.filter(s => isOpenNow(s.hours));
+}
+
+// Sorteer op afstand als postcode meegegeven
+if (req.query.lat && req.query.lng) {
+  const userLat = parseFloat(req.query.lat);
+  const userLng = parseFloat(req.query.lng);
+  shops.sort((a, b) =>
+    haversine(userLat, userLng, a.lat, a.lng) - haversine(userLat, userLng, b.lat, b.lng)
+  );
+  // Voeg afstand toe
+  shops = shops.map(s => ({
+    ...s,
+    distanceKm: Math.round(haversine(userLat, userLng, s.lat, s.lng) * 10) / 10
+  }));
+}
+
+res.json({ count: shops.length, shops });
+```
+
+} catch (e) {
+res.status(500).json({ error: e.message });
+}
+});
+
+// GET /shops/:id — één winkel
+app.get(’/shops/:id’, (req, res) => {
+const shop = db.getById(req.params.id);
+if (!shop) return res.status(404).json({ error: ‘Winkel niet gevonden’ });
+res.json(shop);
+});
+
+// POST /shops — nieuwe winkel toevoegen
+app.post(’/shops’, requireKey, (req, res) => {
+const { name, city } = req.body;
+if (!name || !city) return res.status(400).json({ error: ‘name en city zijn verplicht’ });
+
+const shop = {
+…req.body,
+id: req.body.id || generateId(name, city),
+source: ‘handmatig’,
+};
+
+try {
+db.upsert(shop);
+res.status(201).json(db.getById(shop.id));
+} catch (e) {
+res.status(500).json({ error: e.message });
+}
+});
+
+// PUT /shops/:id — winkel bijwerken
+app.put(’/shops/:id’, requireKey, (req, res) => {
+const existing = db.getById(req.params.id);
+if (!existing) return res.status(404).json({ error: ‘Winkel niet gevonden’ });
+
+try {
+db.upsert({ …existing, …req.body, id: req.params.id });
+res.json(db.getById(req.params.id));
+} catch (e) {
+res.status(500).json({ error: e.message });
+}
+});
+
+// DELETE /shops/:id — winkel verwijderen
+app.delete(’/shops/:id’, requireKey, (req, res) => {
+db.remove(req.params.id);
+res.json({ ok: true });
+});
+
+// POST /scrape — scraper handmatig starten
+app.post(’/scrape’, requireKey, async (req, res) => {
+const sources = req.body.sources || [‘osm’];
+res.json({ ok: true, message: ‘Scraper gestart op de achtergrond’ });
+// Async, blocking response al gestuurd
+try {
+await runScraper({ sources });
+} catch (e) {
+console.error(‘Scraper fout:’, e);
+}
+});
+
+// GET /stats — database statistieken
+app.get(’/stats’, (req, res) => {
+res.json(db.getStats());
+});
+
+// Health check
+app.get(’/health’, (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ─── Geplande scraper ─────────────────────────────────────────────────────────
+// Elke nacht om 03:00 draaien
+cron.schedule(‘0 3 * * *’, async () => {
+console.log(‘⏰ Nachtelijke scraper gestart…’);
+try {
+await runScraper({ sources: [‘osm’, ‘kringloopwijzer’] });
+} catch (e) {
+console.error(‘Geplande scraper fout:’, e);
+}
+}, { timezone: ‘Europe/Amsterdam’ });
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function haversine(lat1, lng1, lat2, lng2) {
+const R = 6371;
+const dLat = (lat2 - lat1) * Math.PI / 180;
+const dLng = (lng2 - lng1) * Math.PI / 180;
+const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function isOpenNow(hours) {
+const days = [‘Zo’,‘Ma’,‘Di’,‘Wo’,‘Do’,‘Vr’,‘Za’];
+const today = days[new Date().getDay()];
+const h = hours?.[today];
+if (!h || h === ‘Gesloten’) return false;
+const [open, close] = h.split(’ - ‘);
+const now = new Date();
+const nowMins = now.getHours() * 60 + now.getMinutes();
+const [oh, om] = open.split(’:’).map(Number);
+const [ch, cm] = close.split(’:’).map(Number);
+return nowMins >= oh * 60 + om && nowMins < ch * 60 + cm;
+}
+
+function generateId(name, city) {
+return `${name}-${city}`.toLowerCase().replace(/[^a-z0-9]+/g, ‘-’).replace(/^-|-$/g, ‘’);
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+console.log(`\n🧺 KringloopKompas API draait op poort ${PORT}`);
+console.log(`   GET  /shops`);
+console.log(`   GET  /shops/:id`);
+console.log(`   POST /shops`);
+console.log(`   POST /scrape`);
+console.log(`   GET  /stats`);
+console.log(`   GET  /health\n`);
+});
