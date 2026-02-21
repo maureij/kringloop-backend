@@ -1,0 +1,162 @@
+// db.js — SQLite database setup
+const Database = require(‘better-sqlite3’);
+const path = require(‘path’);
+
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, ‘kringloop.db’);
+const db = new Database(DB_PATH);
+
+// Enable WAL mode for better concurrent read performance
+db.pragma(‘journal_mode = WAL’);
+
+// Create tables
+db.exec(`
+CREATE TABLE IF NOT EXISTS shops (
+id          TEXT PRIMARY KEY,
+name        TEXT NOT NULL,
+city        TEXT NOT NULL,
+address     TEXT,
+postcode    TEXT,
+lat         REAL,
+lng         REAL,
+rating      REAL DEFAULT 0,
+review_count INTEGER DEFAULT 0,
+phone       TEXT,
+website     TEXT,
+source      TEXT DEFAULT ‘scraper’,
+scraped_at  TEXT,
+created_at  TEXT DEFAULT (datetime(‘now’)),
+updated_at  TEXT DEFAULT (datetime(‘now’))
+);
+
+CREATE TABLE IF NOT EXISTS shop_hours (
+shop_id TEXT NOT NULL,
+day     TEXT NOT NULL,
+hours   TEXT,
+PRIMARY KEY (shop_id, day),
+FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS shop_assortment (
+shop_id  TEXT NOT NULL,
+category TEXT NOT NULL,
+PRIMARY KEY (shop_id, category),
+FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS shop_reviews (
+id       INTEGER PRIMARY KEY AUTOINCREMENT,
+shop_id  TEXT NOT NULL,
+review   TEXT NOT NULL,
+author   TEXT,
+source   TEXT DEFAULT ‘google’,
+FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS scrape_log (
+id         INTEGER PRIMARY KEY AUTOINCREMENT,
+source     TEXT,
+status     TEXT,
+shops_found INTEGER DEFAULT 0,
+message    TEXT,
+ran_at     TEXT DEFAULT (datetime(‘now’))
+);
+`);
+
+// — Helper functions —
+
+const getAll = () => {
+const shops = db.prepare(‘SELECT * FROM shops ORDER BY rating DESC’).all();
+return shops.map(hydrate);
+};
+
+const getById = (id) => {
+const shop = db.prepare(‘SELECT * FROM shops WHERE id = ?’).get(id);
+if (!shop) return null;
+return hydrate(shop);
+};
+
+const upsert = (shop) => {
+const now = new Date().toISOString();
+db.prepare(`INSERT INTO shops (id, name, city, address, postcode, lat, lng, rating, review_count, phone, website, source, scraped_at, updated_at) VALUES (@id, @name, @city, @address, @postcode, @lat, @lng, @rating, @review_count, @phone, @website, @source, @scraped_at, @updated_at) ON CONFLICT(id) DO UPDATE SET name = excluded.name, city = excluded.city, address = excluded.address, postcode = excluded.postcode, lat = excluded.lat, lng = excluded.lng, rating = excluded.rating, review_count = excluded.review_count, phone = excluded.phone, website = excluded.website, source = excluded.source, scraped_at = excluded.scraped_at, updated_at = excluded.updated_at`).run({ …shop, updated_at: now, scraped_at: shop.scraped_at || now });
+
+// Hours
+if (shop.hours) {
+const delHours = db.prepare(‘DELETE FROM shop_hours WHERE shop_id = ?’);
+const insHour = db.prepare(‘INSERT OR REPLACE INTO shop_hours (shop_id, day, hours) VALUES (?, ?, ?)’);
+delHours.run(shop.id);
+for (const [day, h] of Object.entries(shop.hours)) {
+insHour.run(shop.id, day, h);
+}
+}
+
+// Assortment
+if (shop.assortment) {
+const delAss = db.prepare(‘DELETE FROM shop_assortment WHERE shop_id = ?’);
+const insAss = db.prepare(‘INSERT OR IGNORE INTO shop_assortment (shop_id, category) VALUES (?, ?)’);
+delAss.run(shop.id);
+for (const cat of shop.assortment) insAss.run(shop.id, cat);
+}
+
+// Reviews
+if (shop.reviews?.length) {
+const delRev = db.prepare(‘DELETE FROM shop_reviews WHERE shop_id = ?’);
+const insRev = db.prepare(‘INSERT INTO shop_reviews (shop_id, review, author, source) VALUES (?, ?, ?, ?)’);
+delRev.run(shop.id);
+for (const r of shop.reviews) {
+if (typeof r === ‘string’) insRev.run(shop.id, r, null, ‘scraped’);
+else insRev.run(shop.id, r.text, r.author, r.source || ‘scraped’);
+}
+}
+};
+
+const remove = (id) => {
+db.prepare(‘DELETE FROM shops WHERE id = ?’).run(id);
+};
+
+const logScrape = (source, status, shops_found, message) => {
+db.prepare(‘INSERT INTO scrape_log (source, status, shops_found, message) VALUES (?, ?, ?, ?)’).run(source, status, shops_found, message || ‘’);
+};
+
+const getStats = () => {
+return {
+total: db.prepare(‘SELECT COUNT(*) as c FROM shops’).get().c,
+withStoffen: db.prepare(“SELECT COUNT(DISTINCT shop_id) as c FROM shop_assortment WHERE category = ‘Stoffen’”).get().c,
+withVintage: db.prepare(“SELECT COUNT(DISTINCT shop_id) as c FROM shop_assortment WHERE category = ‘Vintage’”).get().c,
+highRated: db.prepare(’SELECT COUNT(*) as c FROM shops WHERE rating >= 4’).get().c,
+lastScrape: db.prepare(‘SELECT ran_at FROM scrape_log ORDER BY ran_at DESC LIMIT 1’).get()?.ran_at || null,
+};
+};
+
+// Hydrate a flat shop row into nested object
+function hydrate(row) {
+const hours = {};
+db.prepare(‘SELECT day, hours FROM shop_hours WHERE shop_id = ?’).all(row.id)
+.forEach(h => { hours[h.day] = h.hours; });
+
+const assortment = db.prepare(‘SELECT category FROM shop_assortment WHERE shop_id = ?’).all(row.id)
+.map(a => a.category);
+
+const reviews = db.prepare(‘SELECT review FROM shop_reviews WHERE shop_id = ?’).all(row.id)
+.map(r => r.review);
+
+return {
+id: row.id,
+name: row.name,
+city: row.city,
+address: row.address,
+postcode: row.postcode,
+lat: row.lat,
+lng: row.lng,
+rating: row.rating,
+reviewCount: row.review_count,
+phone: row.phone,
+website: row.website,
+source: row.source,
+scrapedAt: row.scraped_at,
+hours,
+assortment,
+reviews,
+};
+}
+
+module.exports = { getAll, getById, upsert, remove, logScrape, getStats };
