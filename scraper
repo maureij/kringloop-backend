@@ -1,0 +1,384 @@
+// scraper.js — Haalt kringloop- en vintagewinkels op uit meerdere bronnen
+require(‘dotenv’).config();
+const { chromium } = require(‘playwright’);
+const axios = require(‘axios’);
+const cheerio = require(‘cheerio’);
+const { upsert, logScrape } = require(’./db’);
+
+// ─── Hulpfuncties ────────────────────────────────────────────────────────────
+
+function generateId(name, city) {
+return `${name}-${city}`.toLowerCase()
+.replace(/[^a-z0-9]+/g, ‘-’)
+.replace(/^-|-$/g, ‘’);
+}
+
+function normalizePostcode(raw) {
+if (!raw) return null;
+const match = raw.replace(/\s/g, ‘’).match(/(\d{4}[A-Z]{2})/i);
+return match ? match[1].toUpperCase() : null;
+}
+
+// Ruwe postcode → lat/lng (simpele lookup voor NL regio’s)
+// In productie: gebruik een geocoding API zoals Nominatim/OpenStreetMap
+const POSTCODE_CENTROIDS = {
+‘10’: [52.37, 4.90], ‘11’: [52.36, 4.91], ‘12’: [52.38, 4.89],
+‘20’: [52.38, 4.64], ‘21’: [52.35, 4.57], ‘22’: [52.39, 4.63],
+‘25’: [52.07, 4.30], ‘26’: [52.05, 4.36], ‘27’: [52.01, 4.37],
+‘30’: [51.92, 4.48], ‘31’: [51.91, 4.47], ‘32’: [51.93, 4.50],
+‘35’: [52.09, 5.12], ‘36’: [52.08, 5.10], ‘37’: [52.07, 5.13],
+‘40’: [51.57, 5.07], ‘41’: [51.56, 5.09], ‘56’: [51.44, 5.48],
+‘63’: [51.83, 5.86], ‘68’: [51.99, 5.91], ‘75’: [52.27, 6.79],
+‘80’: [53.20, 6.56], ‘97’: [53.21, 6.57], ‘98’: [53.22, 6.58],
+‘85’: [51.69, 5.30], ‘60’: [51.98, 5.91], ‘76’: [52.51, 6.09],
+};
+
+function postcodeToCoords(pc) {
+if (!pc) return [52.13, 5.29]; // centrum NL
+const prefix = pc.substring(0, 2);
+return POSTCODE_CENTROIDS[prefix] || [52.13, 5.29];
+}
+
+// Classify assortiment op basis van tekst
+function classifyAssortment(text = ‘’) {
+const t = text.toLowerCase();
+const tags = [];
+if (t.match(/kleding|mode|fashion|shirts|broek|jas|jurk|blous/)) tags.push(‘Kleding’);
+if (t.match(/vintage|retro|jaren [456789]0|tweedehands.*design/)) tags.push(‘Vintage’);
+if (t.match(/stof|stoffen|textiel|laken|gordijn|naaien|mercerie/)) tags.push(‘Stoffen’);
+if (t.match(/naai|patroon|knoop|rits|mercerie|garen/)) tags.push(‘Naaibenodigdheden’);
+if (t.match(/meubel|kast|tafel|stoel|bank|wonen|interieur/)) tags.push(‘Meubels’);
+if (t.match(/boek|tijdschrift|cd|dvd|vinyl|plaat/)) tags.push(‘Boeken & media’);
+if (t.match(/electroni|computer|telefoon|apparaat/)) tags.push(‘Elektronica’);
+if (t.match(/sieraad|ketting|ring|armband|juwel/)) tags.push(‘Sieraden’);
+if (t.match(/accessoire|tas|riem|sjaal|hoed/)) tags.push(‘Accessoires’);
+return […new Set(tags)];
+}
+
+// ─── Bron 1: OpenStreetMap Overpass API ─────────────────────────────────────
+// Gratis, geen API-key nodig. Haalt alle second_hand winkels op in NL.
+
+async function scrapeOpenStreetMap() {
+console.log(‘🗺  Scraping OpenStreetMap (Overpass API)…’);
+const query = `[out:json][timeout:60]; area["ISO3166-1"="NL"]->.nl; ( node["shop"="second_hand"](area.nl); node["shop"="vintage"](area.nl); node["shop"="clothes"]["second_hand"="yes"](area.nl); node["amenity"="kringloopwinkel"](area.nl); ); out body;`;
+
+const res = await axios.post(
+‘https://overpass-api.de/api/interpreter’,
+`data=${encodeURIComponent(query)}`,
+{ headers: { ‘Content-Type’: ‘application/x-www-form-urlencoded’ }, timeout: 70000 }
+);
+
+const elements = res.data?.elements || [];
+console.log(`   → ${elements.length} locaties gevonden in OSM`);
+
+const shops = [];
+for (const el of elements) {
+const tags = el.tags || {};
+const name = tags.name || tags[‘name:nl’];
+if (!name) continue;
+
+```
+const city = tags['addr:city'] || tags['addr:place'] || 'Onbekend';
+const postcode = normalizePostcode(tags['addr:postcode']);
+const [lat, lng] = postcode
+  ? postcodeToCoords(postcode)
+  : [el.lat || 52.13, el.lon || 5.29];
+
+// Bouw assortiment op basis van OSM tags + naam
+const textForClassify = [name, tags.description, tags['shop:clothes'], tags.goods].filter(Boolean).join(' ');
+const assortment = classifyAssortment(textForClassify);
+if (assortment.length === 0) assortment.push('Kleding'); // standaard
+
+const hours = parseOSMHours(tags.opening_hours);
+
+shops.push({
+  id: generateId(name, city),
+  name,
+  city,
+  address: [tags['addr:street'], tags['addr:housenumber']].filter(Boolean).join(' ') || null,
+  postcode,
+  lat,
+  lng,
+  rating: 0,
+  review_count: 0,
+  phone: tags.phone || tags['contact:phone'] || null,
+  website: tags.website || tags['contact:website'] || null,
+  source: 'openstreetmap',
+  hours,
+  assortment,
+  reviews: [],
+});
+```
+
+}
+
+return shops;
+}
+
+function parseOSMHours(raw) {
+// Simpele parser voor “Mo-Fr 09:00-17:00; Sa 09:00-15:00”
+const days = { Ma: null, Di: null, Wo: null, Do: null, Vr: null, Za: null, Zo: null };
+if (!raw) return days;
+// Zet standaard tijden als we de string herkennen
+if (raw.includes(‘Mo-Fr’)) {
+const match = raw.match(/Mo-Fr\s+([\d:]+)-([\d:]+)/);
+if (match) {
+[‘Ma’,‘Di’,‘Wo’,‘Do’,‘Vr’].forEach(d => days[d] = `${match[1]} - ${match[2]}`);
+}
+}
+if (raw.includes(‘Sa’)) {
+const match = raw.match(/Sa\s+([\d:]+)-([\d:]+)/);
+if (match) days[‘Za’] = `${match[1]} - ${match[2]}`;
+}
+if (raw.includes(‘Su’) || raw.includes(‘PH off’)) {
+days[‘Zo’] = ‘Gesloten’;
+}
+return days;
+}
+
+// ─── Bron 2: Kringloopwijzer.nl scraper ─────────────────────────────────────
+
+async function scrapeKringloopwijzer() {
+console.log(‘🌐 Scraping Kringloopwijzer.nl…’);
+const browser = await chromium.launch({ headless: true });
+const shops = [];
+
+try {
+const page = await browser.newPage();
+await page.setExtraHTTPHeaders({ ‘Accept-Language’: ‘nl-NL’ });
+
+```
+// Kringloopwijzer heeft een overzichtspagina per provincie
+const provinces = ['noord-holland','zuid-holland','utrecht','gelderland',
+                   'noord-brabant','limburg','overijssel','groningen','friesland',
+                   'drenthe','flevoland','zeeland'];
+
+for (const prov of provinces) {
+  try {
+    await page.goto(`https://www.kringloopwijzer.nl/winkels/${prov}`, {
+      waitUntil: 'domcontentloaded', timeout: 15000
+    });
+
+    const items = await page.$$eval('.winkel-item, .shop-card, article.shop', els =>
+      els.map(el => ({
+        name: el.querySelector('h2, h3, .name')?.textContent?.trim(),
+        city: el.querySelector('.city, .stad, .location')?.textContent?.trim(),
+        address: el.querySelector('.address, .adres')?.textContent?.trim(),
+        phone: el.querySelector('.phone, .tel')?.textContent?.trim(),
+        website: el.querySelector('a[href*="http"]')?.href,
+        description: el.querySelector('p, .description')?.textContent?.trim(),
+      }))
+    );
+
+    for (const item of items) {
+      if (!item.name) continue;
+      const city = item.city || prov;
+      const assortment = classifyAssortment(item.description || item.name);
+      if (assortment.length === 0) assortment.push('Kleding');
+
+      shops.push({
+        id: generateId(item.name, city),
+        name: item.name,
+        city,
+        address: item.address || null,
+        postcode: null,
+        lat: 52.13, lng: 5.29, // wordt verfijnd door geocoder
+        rating: 0,
+        review_count: 0,
+        phone: item.phone || null,
+        website: item.website || null,
+        source: 'kringloopwijzer',
+        hours: { Ma: null, Di: null, Wo: null, Do: null, Vr: null, Za: null, Zo: null },
+        assortment,
+        reviews: [],
+      });
+    }
+    console.log(`   ${prov}: ${items.length} winkels`);
+    await page.waitForTimeout(1000); // beleefd scrapen
+  } catch (e) {
+    console.warn(`   ⚠ ${prov}: ${e.message}`);
+  }
+}
+```
+
+} finally {
+await browser.close();
+}
+
+console.log(`   → ${shops.length} winkels van Kringloopwijzer`);
+return shops;
+}
+
+// ─── Bron 3: Marktplaats vintage kleding winkels ─────────────────────────────
+
+async function scrapeMarktplaatsVintage() {
+console.log(‘🛍  Scraping Marktplaats vintage winkels…’);
+const browser = await chromium.launch({ headless: true });
+const shops = [];
+
+try {
+const page = await browser.newPage();
+await page.goto(‘https://www.marktplaats.nl/l/kleding-dames/p/1/?query=vintage+winkel&isShops=true’, {
+waitUntil: ‘domcontentloaded’, timeout: 20000
+});
+
+```
+const items = await page.$$eval('[data-item-id], .mp-Listing', els =>
+  els.slice(0, 30).map(el => ({
+    name: el.querySelector('.mp-Listing-title, h3')?.textContent?.trim(),
+    city: el.querySelector('.mp-Listing-location, .location')?.textContent?.trim(),
+    description: el.querySelector('.mp-Listing-description, p')?.textContent?.trim(),
+  }))
+);
+
+for (const item of items) {
+  if (!item.name || item.name.length < 3) continue;
+  const city = item.city?.split(',')[0]?.trim() || 'Nederland';
+  shops.push({
+    id: generateId(item.name, city),
+    name: item.name,
+    city,
+    address: null,
+    postcode: null,
+    lat: 52.13, lng: 5.29,
+    rating: 0,
+    review_count: 0,
+    phone: null,
+    website: null,
+    source: 'marktplaats',
+    hours: {},
+    assortment: classifyAssortment(item.description || '') || ['Vintage', 'Kleding'],
+    reviews: [],
+  });
+}
+```
+
+} catch (e) {
+console.warn(’   ⚠ Marktplaats scrape mislukt:’, e.message);
+} finally {
+await browser.close();
+}
+
+console.log(`   → ${shops.length} items van Marktplaats`);
+return shops;
+}
+
+// ─── Geocoder: adres → lat/lng via Nominatim (OpenStreetMap, gratis) ─────────
+
+async function geocodeShop(shop) {
+if (shop.lat !== 52.13 || !shop.address) return shop; // al gecodeerd
+try {
+const query = [shop.address, shop.city, ‘Nederland’].filter(Boolean).join(’, ’);
+const res = await axios.get(‘https://nominatim.openstreetmap.org/search’, {
+params: { q: query, format: ‘json’, limit: 1, countrycodes: ‘nl’ },
+headers: { ‘User-Agent’: ‘KringloopKompas/1.0 (persoonlijk gebruik)’ },
+timeout: 5000,
+});
+if (res.data?.[0]) {
+shop.lat = parseFloat(res.data[0].lat);
+shop.lng = parseFloat(res.data[0].lon);
+}
+await new Promise(r => setTimeout(r, 1100)); // Nominatim rate limit: max 1/sec
+} catch { /* stil falen */ }
+return shop;
+}
+
+// ─── Dedupliceer op id ────────────────────────────────────────────────────────
+
+function deduplicate(shops) {
+const seen = new Map();
+for (const shop of shops) {
+if (!seen.has(shop.id)) {
+seen.set(shop.id, shop);
+} else {
+// Merge: neem de beste data
+const existing = seen.get(shop.id);
+if (shop.rating > existing.rating) existing.rating = shop.rating;
+if (shop.phone && !existing.phone) existing.phone = shop.phone;
+if (shop.website && !existing.website) existing.website = shop.website;
+const allCats = […new Set([…existing.assortment, …shop.assortment])];
+existing.assortment = allCats;
+}
+}
+return […seen.values()];
+}
+
+// ─── Hoofd scrape-functie ─────────────────────────────────────────────────────
+
+async function runScraper({ sources = [‘osm’, ‘kringloopwijzer’] } = {}) {
+console.log(’\n🚀 KringloopKompas scraper gestart:’, new Date().toLocaleString(‘nl-NL’));
+let allShops = [];
+
+if (sources.includes(‘osm’)) {
+try {
+const shops = await scrapeOpenStreetMap();
+allShops.push(…shops);
+logScrape(‘openstreetmap’, ‘success’, shops.length, null);
+} catch (e) {
+console.error(‘OSM fout:’, e.message);
+logScrape(‘openstreetmap’, ‘error’, 0, e.message);
+}
+}
+
+if (sources.includes(‘kringloopwijzer’)) {
+try {
+const shops = await scrapeKringloopwijzer();
+allShops.push(…shops);
+logScrape(‘kringloopwijzer’, ‘success’, shops.length, null);
+} catch (e) {
+console.error(‘Kringloopwijzer fout:’, e.message);
+logScrape(‘kringloopwijzer’, ‘error’, 0, e.message);
+}
+}
+
+if (sources.includes(‘marktplaats’)) {
+try {
+const shops = await scrapeMarktplaatsVintage();
+allShops.push(…shops);
+logScrape(‘marktplaats’, ‘success’, shops.length, null);
+} catch (e) {
+console.error(‘Marktplaats fout:’, e.message);
+logScrape(‘marktplaats’, ‘error’, 0, e.message);
+}
+}
+
+// Dedupliceer
+const unique = deduplicate(allShops);
+console.log(`\n✂️  Na deduplicatie: ${unique.length} unieke winkels (was ${allShops.length})`);
+
+// Filter: alleen winkels met relevante categorieën
+const relevant = unique.filter(s =>
+s.assortment.some(a => [‘Kleding’,‘Vintage’,‘Stoffen’,‘Naaibenodigdheden’,‘Accessoires’,‘Sieraden’].includes(a))
+);
+console.log(`🧵 Relevant voor kleding/stoffen: ${relevant.length} winkels`);
+
+// Geocode shops zonder coördinaten (max 50 per run om de Nominatim limiet te respecteren)
+const toGeocode = relevant.filter(s => s.lat === 52.13).slice(0, 50);
+if (toGeocode.length > 0) {
+console.log(`📍 Geocoding ${toGeocode.length} adressen...`);
+for (const shop of toGeocode) await geocodeShop(shop);
+}
+
+// Sla op in database
+let saved = 0;
+for (const shop of relevant) {
+try {
+upsert(shop);
+saved++;
+} catch (e) {
+console.warn(`  ⚠ Kon ${shop.name} niet opslaan:`, e.message);
+}
+}
+
+console.log(`\n✅ Klaar! ${saved} winkels opgeslagen in database.\n`);
+return { total: allShops.length, unique: unique.length, relevant: relevant.length, saved };
+}
+
+// Draai direct als script
+if (require.main === module) {
+runScraper({ sources: [‘osm’, ‘kringloopwijzer’] })
+.then(r => { console.log(‘Resultaat:’, r); process.exit(0); })
+.catch(e => { console.error(e); process.exit(1); });
+}
+
+module.exports = { runScraper };
